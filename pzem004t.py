@@ -8,6 +8,8 @@ from zigpy.zcl.clusters.general import Basic, OnOffConfiguration, AnalogInput, M
 from zigpy.zcl.clusters.measurement import TemperatureMeasurement
 from zigpy.zcl.clusters.smartenergy import Metering
 
+from homeassistant.components.zha.sensor import ElectricalMeasurement as EM
+
 from zhaquirks.const import (
     DEVICE_TYPE,
     ENDPOINTS,
@@ -24,11 +26,22 @@ CURRENT_REPORTED = "current_reported"
 POWER_REPORTED = "power_reported"
 FREQUENCY_REPORTED = "frequency_reported"
 POWER_FACTOR_REPORTED = "power_factor_reported"
-ENERGY_REPORTED = "energy_reported"
-INSTANTANEOUS_DEMAND = "instantaneous_demand"
 APPARENT_POWER_REPORTED = "apparent_power_reported"
 
+CONSUMPTION_REPORTED = "consumption_reported"
+INSTANTANEOUS_DEMAND = "instantaneous_demand"
+
 PTVO_DEVICE = 0xfffe
+
+
+def myformatter(self, value: int) -> int | float:
+    """Return 'normalized' value."""
+    multiplier = getattr(self._channel, f"{self._div_mul_prefix}_multiplier")
+    divisor = getattr(self._channel, f"{self._div_mul_prefix}_divisor")
+    value = float(value * multiplier) / divisor
+    return round(value, self._decimals)
+
+EM.formatter = myformatter
 
 
 class PtvoAnalogInputCluster(CustomCluster, AnalogInput):
@@ -75,7 +88,7 @@ class PtvoAnalogInputCluster(CustomCluster, AnalogInput):
                     p_value = self._current_value
                     p_value1 = self._current_value / 1000
                     self.endpoint.device.electrical_bus.listener_event(POWER_REPORTED, p_value)
-                    self.endpoint.device.energy_bus.listener_event(INSTANTANEOUS_DEMAND, p_value1)
+                    self.endpoint.device.consumption_bus.listener_event(INSTANTANEOUS_DEMAND, p_value1)
                     
                 if value == "Hz":
                     """Frequency value."""
@@ -90,34 +103,7 @@ class PtvoAnalogInputCluster(CustomCluster, AnalogInput):
                 if value == "Wh":
                     """Energy value."""
                     e_value = self._current_value / 1000
-                    self.endpoint.device.energy_bus.listener_event(ENERGY_REPORTED, e_value)
-
-
-class SmartEnergyCluster(LocalDataCluster, Metering):
-
-    cluster_id = Metering.cluster_id
-    CURRENT_SUMM_DELIVERED_VALUE_ID = 0x0000
-    INSTANTANEOUS_DEMAND_VALUE_ID = 0x0400
-
-    _CONSTANT_ATTRIBUTES = {
-        0x0300: 0,  # unit_of_measure: kWh
-        0x0301: 1,  # multiplier
-        0x0302: 1000,  # divisor
-        0x0306: 0,  # metering_device_type: electric
-    }
-    
-    def __init__(self, *args, **kwargs):
-        """Init."""
-        super().__init__(*args, **kwargs)
-        self.endpoint.device.energy_bus.add_listener(self)
-
-    def energy_reported(self, value):
-        """Energy reported."""
-        self._update_attribute(self.CURRENT_SUMM_DELIVERED_VALUE_ID, value)
-        
-    def instantaneous_demand(self, value):
-        """Instantaneous power demand reported."""
-        self._update_attribute(self.INSTANTANEOUS_DEMAND_VALUE_ID, value)
+                    self.endpoint.device.consumption_bus.listener_event(CONSUMPTION_REPORTED, e_value)
 
 
 class TemperatureMeasurementCluster(LocalDataCluster, TemperatureMeasurement):
@@ -176,6 +162,48 @@ class ElectricalMeasurementCluster(LocalDataCluster, ElectricalMeasurement):
         self._update_attribute(self.APPARENT_POWER_ID, value)
 
 
+class MeteringCluster(LocalDataCluster, Metering):
+    """Metering cluster to receive reports that are sent to the basic cluster."""
+
+    cluster_id = Metering.cluster_id
+    CURRENT_SUMM_DELIVERED_ID = 0x0000
+    INSTANTANEOUS_DEMAND_ID = 0x0400
+    
+    UNIT_OF_MEASUREMENT = 0x0300
+    MULTIPLIER = 0x0301
+    DIVISOR = 0x0302
+    SUMMATION_FORMATTING = 0x0303
+    METERING_DEVICE_TYPE = 0x0306
+
+    _CONSTANT_ATTRIBUTES = {
+        0x0300: 0,  # unit_of_measure: kWh
+        0x0301: 1,  # multiplier
+        0x0302: 1000,  # divisor
+        0x0303: 0b0_0100_011,  # summation_formatting
+        0x0306: 0,  # metering_device_type: electric
+    }
+
+    def __init__(self, *args, **kwargs):
+        """Init."""
+        super().__init__(*args, **kwargs)
+        self.endpoint.device.consumption_bus.add_listener(self)
+
+        # initialize constant attributes
+        self._update_attribute(self.UNIT_OF_MEASUREMENT, 0)
+        self._update_attribute(self.MULTIPLIER, 1)
+        self._update_attribute(self.DIVISOR, 1000)
+        self._update_attribute(self.SUMMATION_FORMATTING, 0b0_0100_011)
+        self._update_attribute(self.METERING_DEVICE_TYPE, 0)
+
+    def consumption_reported(self, value):
+        """Consumption reported."""
+        self._update_attribute(self.CURRENT_SUMM_DELIVERED_ID, round(value))
+        
+    def instantaneous_demand(self, value):
+        """Instantaneous demand reported."""
+        self._update_attribute(self.INSTANTANEOUS_DEMAND_ID, value)
+
+
 class pzem004t(CustomDevice):
     """PZEM-004T Ver 3 based on PTVO firmware."""
 
@@ -183,7 +211,7 @@ class pzem004t(CustomDevice):
         """Init device."""
         self.temperature_bus = Bus()
         self.electrical_bus = Bus()
-        self.energy_bus = Bus()
+        self.consumption_bus = Bus()
         
         super().__init__(*args, **kwargs)
 
@@ -244,8 +272,8 @@ class pzem004t(CustomDevice):
                     OnOffConfiguration.cluster_id,
                     MultistateValue.cluster_id,
                     TemperatureMeasurementCluster,
-                    SmartEnergyCluster,
                     ElectricalMeasurementCluster,
+                    MeteringCluster,
                 ],
                 OUTPUT_CLUSTERS: [Basic.cluster_id],
             },
